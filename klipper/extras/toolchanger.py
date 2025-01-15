@@ -59,7 +59,9 @@ class Toolchanger:
         self.error_message = ''
 
         self.drop_docksense_corrections = {}
+        self.drop_docksense_corrections_current = {}
         self.pick_docksense_corrections = {}
+        self.pick_docksense_corrections_current = {}
 
         self.last_dropoff_tool = None
         self.last_pickup_tool = None
@@ -91,14 +93,17 @@ class Toolchanger:
                                     self.cmd_RESET_TOOL_PARAMETER)
         self.gcode.register_command("TTC_SAVE_TOOL_PARAMETER",
                                     self.cmd_SAVE_TOOL_PARAMETER)
-        # @Tem
+        # Pause/Resume
+        self.gcode.register_command("TTC_PAUSE",
+                                    self.cmd_PAUSE,
+                                    desc=self.cmd_PAUSE_help)
         self.gcode.register_command("TTC_PAUSE_DETAILS",
                                     self.cmd_PAUSE_DETAILS,
                                     desc=self.cmd_PAUSE_DETAILS_help)
         self.gcode.register_command("TTC_PAUSE_RESOLVE",
                                     self.cmd_PAUSE_RESOLVE,
                                     desc=self.cmd_PAUSE_RESOLVE_help)
-        #
+        # Offset
         self.gcode.register_command("TTC_SET_TOOL_GCODE_X_OFFSET",
                                     self.cmd_SET_TOOL_GCODE_X_OFFSET,
                                     desc=self.cmd_SET_TOOL_GCODE_X_OFFSET_help)
@@ -111,12 +116,9 @@ class Toolchanger:
         self.gcode.register_command("TTC_SAVE_TOOL_GCODE_OFFSETS",
                                     self.cmd_SAVE_TOOL_GCODE_OFFSETS,
                                     desc=self.cmd_SAVE_TOOL_GCODE_OFFSETS_help)
-        # @Tem
+        # @TODO: remove it later. Legacy
         self.gcode.register_command("TEST_MACROS_RUNNING",
                                     self.cmd_TEST_MACROS_RUNNING)
-        # @TODO: remove it later. Legacy
-        self.gcode.register_command("DROPOFF_WITH_DOCK_CHECK",
-                                    self.cmd_DROPOFF_WITH_DOCK_CHECK)
 
     def _handle_home_rails_begin(self, homing_state, rails):
         if self.initialize_on == INIT_ON_HOME and self.status == STATUS_UNINITALIZED:
@@ -244,7 +246,33 @@ class Toolchanger:
         configfile = self.printer.lookup_object('configfile')
         configfile.set(tool.name, name, tool.params[name])
 
-    # @Tem
+    #
+    cmd_PAUSE_help = "Pauses tool changing process in case of any error."
+    def cmd_PAUSE(self, gcmd):
+      context = {}
+
+      dropoff_tool_number = gcmd.get_int('DT', None)
+      dropoff_tool = None
+      if dropoff_tool_number is not None:
+        dropoff_tool = self.lookup_tool(dropoff_tool_number)
+
+      if dropoff_tool is not None:
+        context['dropoff_tool'] = dropoff_tool
+
+      pickup_tool_number = gcmd.get_int('PT', None)
+      pickup_tool = None
+      if pickup_tool_number is not None:
+        pickup_tool = self.lookup_tool(pickup_tool_number)
+
+      if pickup_tool is not None:
+         context['pickup_tool'] = pickup_tool
+
+      self.execute_toolchange_pause(context, gcmd)
+
+    cmd_PAUSE_DETAILS_help = "Prints deatils about pause."
+    def cmd_PAUSE_DETAILS(self, gcmd):
+        self.toolchange_pause_print_details(gcmd)
+
     cmd_PAUSE_RESOLVE_help = "Initialize the toolchanger after pause and resume print."
     def cmd_PAUSE_RESOLVE(self, gcmd):
         tool_number = gcmd.get_int('T', None)
@@ -255,11 +283,7 @@ class Toolchanger:
         if not tool:
           gcmd.respond_info('Tool T%s was not found.' % (tool_number))
 
-        self.execute_toolchange_pause_resolve(tool)
-
-    cmd_PAUSE_DETAILS_help = "Prints deatils about pause."
-    def cmd_PAUSE_DETAILS(self, gcmd):
-        self.toolchange_pause_print_details(gcmd)
+        self.execute_toolchange_pause_resolve(tool, gcmd)
 
     cmd_SET_TOOL_GCODE_X_OFFSET_help = "Set gcode_x_offset for current tool."
     def cmd_SET_TOOL_GCODE_X_OFFSET(self, gcmd):
@@ -421,20 +445,9 @@ class Toolchanger:
         temp, target_temp = tool.extruder.get_heater().get_temp(curtime)
         gcmd.respond_info("tool temp temp=%s target_temp=%s" % (temp, target_temp))
 
-    # @TODO: Backward compatibility, remove it.
-    def cmd_DROPOFF_WITH_DOCK_CHECK(self, gcmd):
-      if self.status == STATUS_PAUSED:
-        return False
-
-      tool = self._get_tool_from_gcmd(gcmd)
-      self._drop_tool_with_dock_check(tool, None, gcmd)
-
-    def cmd_DROPOFF_WITH_CARRIAGE_CHECK(self, gcmd):
-      if self.status == STATUS_PAUSED:
-        return
-
-      tool = self._get_tool_from_gcmd(gcmd)
-      self.drop_tool_with_carriage_check(tool, {}, gcmd)
+    # cmd_LIFTBAR_CHECK_HOMED_help = "Check if liftbar was homed properly."
+    # def cmd_LIFTBAR_CHECK_HOMED(self, gcmd):
+    #    return self._check_liftbar_is_homed({}, gcmd)
 
     def initialize(self, select_tool=None):
         if self.status == STATUS_CHANGING:
@@ -984,27 +997,42 @@ class Toolchanger:
 
       if gcmd: gcmd.respond_info("Calling _drop_tool_with_dock_check...")
       x_pos =  tool.params['params_park_x'] - tool.params['params_park_unlock_move']
-      # curtime = self.printer.get_reactor().monotonic()
+
+      x_pos_correction = 0
+      corrections_steps = [0, 0.25, 0.5, 0.75, 1, 1.10, 1.20, 1.30, 1.40, 1.50, 1.6, 1.7, 1.8, 1.9, 2.0]
+
+      if tool.tool_number not in self.drop_docksense_corrections:
+        self.drop_docksense_corrections[tool.tool_number] = []
+
+      if tool.tool_number not in self.drop_docksense_corrections_current:
+        self.drop_docksense_corrections_current[tool.tool_number] = 0
+
+      x_pos_correction = self.drop_docksense_corrections_current[tool.tool_number]
+      if len(self.drop_docksense_corrections[tool.tool_number]) > 5:
+        avg = sum(self.drop_docksense_corrections[tool.tool_number]) / len(self.drop_docksense_corrections[tool.tool_number])
+        if avg > corrections_steps[1]:
+           x_pos_correction = x_pos_correction + (corrections_steps[1] / 2)
+           self.drop_docksense_corrections_current[tool.tool_number] = x_pos_correction # save it for next run
+           self.drop_docksense_corrections[tool.tool_number] = [] # reset stats
 
       cfg = self.get_macro_vars("_TOOLCHANGER_CONFIGURATION")
       end_parking_speed = cfg['end_parking_speed']
       speed_ratio       = cfg['speed_ratio']
 
       self.gcode_move.cmd_G90(self.gcode.create_gcode_command("G90", "G90", {})) # go absolute
-      for step in [0, 0.25, 0.5, 0.75, 1, 1.10, 1.20, 1.30, 1.40, 1.50, 1.6, 1.7, 1.8, 1.9, 2.0]:
-        if gcmd: gcmd.respond_info("Toolhead T%s checking docksense with step=%s." % (tool.tool_number, step))
-        g0_params = {'X': (x_pos - step), 'F': (end_parking_speed * speed_ratio)}
+      for step in corrections_steps:
+        if gcmd: gcmd.respond_info("Toolhead T%s checking docksense with step=%s (correction=%s)." % (tool.tool_number, step, x_pos_correction))
+        g0_params = {'X': (x_pos - (step + x_pos_correction)), 'F': (end_parking_speed * speed_ratio)}
         self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G1", "G1", g0_params))
         self.run_gcode_from_command("M400")
         if self.check_dock_state(tool, 'PRESSED'):
             if gcmd: gcmd.respond_info("Toolhead T%s docksense was triggered." % (tool.tool_number))
 
-            if tool.tool_number not in self.drop_docksense_corrections:
-              self.drop_docksense_corrections[tool.tool_number] = []
             if len(self.drop_docksense_corrections[tool.tool_number]) > 100:
               avg_correction = sum(self.drop_docksense_corrections[tool.tool_number]) / len(self.drop_docksense_corrections[tool.tool_number])
               self.drop_docksense_corrections[tool.tool_number] = []
               self.drop_docksense_corrections[tool.tool_number].append(avg_correction)
+
             self.drop_docksense_corrections[tool.tool_number].append(step)
             if gcmd:
               gcmd.respond_info("Toolhead T%s average `drop_docksense_corrections` step correction=%s." %
@@ -1079,7 +1107,6 @@ class Toolchanger:
 
       if gcmd: gcmd.respond_info("Calling _drop_tool_with_carriage_check...")
       y_pos = tool.params['params_park_y']
-      # curtime = self.printer.get_reactor().monotonic()
 
       cfg = self.get_macro_vars("_TOOLCHANGER_CONFIGURATION")
       end_parking_speed = cfg['end_parking_speed']
@@ -1167,7 +1194,7 @@ class Toolchanger:
         return False
 
       if gcmd: gcmd.respond_info("Calling _pickup_move_to_close_position...")
-      cfg = self.get_macro_vars("_TOOLCHANGER_CONFIGURATION")
+      cfg               = self.get_macro_vars("_TOOLCHANGER_CONFIGURATION")
       safe_y            = cfg['safe_y']
       safe_y_no_tool    = cfg['safe_y_no_tool']
       close_y           = cfg['close_y']
@@ -1188,6 +1215,7 @@ class Toolchanger:
 
       # @TODO: it could be inner variable
       tc_no_tool_attached = self.get_macro_var('PRINT_START', 'tc_no_tool_attached', 0)
+      self.gcode_move.cmd_G90(self.gcode.create_gcode_command("G90", "G90", {})) # go absolute
       if tc_no_tool_attached:
         self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", {
           'Y': (safe_y_no_tool), 'F': (fast_speed * speed_ratio)
@@ -1316,6 +1344,9 @@ class Toolchanger:
 
       cur_x, cur_y, cur_z, cur_e = self.get_current_position()
 
+      if tool.tool_number not in self.pick_docksense_corrections:
+        self.pick_docksense_corrections[tool.tool_number] = []
+
       cfg = self.get_macro_vars("_TOOLCHANGER_CONFIGURATION")
       end_parking_speed = cfg['end_parking_speed']
       speed_ratio       = cfg['speed_ratio']
@@ -1329,8 +1360,6 @@ class Toolchanger:
         if self.check_dock_state(tool, 'RELEASED'):
           if gcmd: gcmd.respond_info("Toolhead T%s docksense was released." % (tool.tool_number))
 
-          if tool.tool_number not in self.pick_docksense_corrections:
-            self.pick_docksense_corrections[tool.tool_number] = []
           if len(self.pick_docksense_corrections[tool.tool_number]) > 100:
             avg_correction = sum(self.pick_docksense_corrections[tool.tool_number]) / len(self.pick_docksense_corrections[tool.tool_number])
             self.pick_docksense_corrections[tool.tool_number] = []
@@ -1440,6 +1469,25 @@ class Toolchanger:
         return False
 
       if gcmd: gcmd.respond_info("Calling _pickup_purge_in_place...")
+      cfg                     = self.get_macro_vars("_TOOLCHANGER_CONFIGURATION")
+      purge_in_place_enabled  = cfg['purge_in_place_enabled']
+      parking_speed           = cfg['parking_speed']
+      speed_ratio             = cfg['speed_ratio']
+
+      pickup_tool = context['pickup_tool']
+
+      is_primed = self.get_macro_var('PRINT_START', 'is_primed', 0)
+      if self.is_in_priniting_state() and (is_primed == 1) and (purge_in_place_enabled == 1):
+        purge_temp_min = self.get_macro_var('_clean_nozzle_varables', 'purge_temp_min', 200)
+        cur_temp, _ = self.get_tool_temps(pickup_tool)
+        if cur_temp >= purge_temp_min:
+          if not self._pickup_move_to_purge_in_place(context, gcmd): return False
+          self.run_gcode_from_command("PURGE_NOZZLE LENGTH=10")
+          if not self._pickup_move_back_from_purge_in_place(context, gcmd): return False
+          self.run_gcode_from_command(
+             'TTC_SET_TOOL_PARAMETER T=%s PARAMETER="params_is_purged_in_place" VALUE=1' %
+             pickup_tool.tool_number)
+
       return True
 
     def _pickup_ramming_on_change(self, context, gcmd = None):
@@ -1454,6 +1502,28 @@ class Toolchanger:
         return False
 
       if gcmd: gcmd.respond_info("Calling _pickup_clean_nozzle_in_place...")
+      cfg                           = self.get_macro_vars("_TOOLCHANGER_CONFIGURATION")
+      wipe_in_place_enabled         = cfg['wipe_in_place_enabled']
+      wipe_in_place_wipes_speed     = cfg['wipe_in_place_wipes_speed']
+      wipe_in_place_wipes_qtw       = cfg['wipe_in_place_wipes_qtw']
+      wipe_in_place_wipes_distance  = cfg['wipe_in_place_wipes_distance']
+
+      is_primed = self.get_macro_var('PRINT_START', 'is_primed', 0)
+
+      if (is_primed == 1) and (wipe_in_place_enabled == 1) and (wipe_in_place_wipes_qtw > 0):
+        self.gcode_move.cmd_G91(self.gcode.create_gcode_command("G91", "G91", {})) # go relative
+        self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", {
+          'Y': 3, 'F': wipe_in_place_wipes_speed
+        }))
+        for i in range(wipe_in_place_wipes_qtw):
+          self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", {
+            'Y': (wipe_in_place_wipes_distance - 3), 'F': wipe_in_place_wipes_speed
+          }))
+          self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", {
+            'Y': (-1 * (wipe_in_place_wipes_distance - 3)), 'F': wipe_in_place_wipes_speed
+          }))
+        self.gcode_move.cmd_G90(self.gcode.create_gcode_command("G90", "G90", {})) # go absolute
+
       return True
 
     def _pickup_retract_on_change(self, context, gcmd = None):
@@ -1520,6 +1590,7 @@ class Toolchanger:
       speed_ratio       = cfg['speed_ratio']
 
       restore_position = context['restore_position']
+      if restore_position is None: return True
 
       self.gcode_move.cmd_G90(self.gcode.create_gcode_command("G90", "G90", {})) # go absolute
 
@@ -1547,6 +1618,63 @@ class Toolchanger:
           'Z': (restore_position['Z']), 'F': (fast_speed_z)
         }))
 
+      return True
+
+    def _pickup_move_to_purge_in_place(self, context, gcmd = None):
+      if self.status == STATUS_PAUSED:
+        return False
+
+      if gcmd: gcmd.respond_info("Calling _pickup_move_to_purge_in_place...")
+      cfg               = self.get_macro_vars("_TOOLCHANGER_CONFIGURATION")
+      safe_y            = cfg['safe_y']
+      safe_y_no_tool    = cfg['safe_y_no_tool']
+      close_y           = cfg['close_y']
+      fast_speed        = cfg['fast_speed']
+      fast_speed_z      = cfg['fast_speed_z']
+      parking_speed     = cfg['parking_speed']
+      end_parking_speed = cfg['end_parking_speed']
+      speed_ratio       = cfg['speed_ratio']
+
+      pickup_tool = context['pickup_tool']
+      unlock_move = pickup_tool.params['params_park_unlock_move']
+
+      self.gcode_move.cmd_G91(self.gcode.create_gcode_command("G91", "G91", {})) # go relative
+      self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", {
+        'Y': 15, 'F': (parking_speed * speed_ratio)
+      }))
+      self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", {
+        'X': (-1 * (unlock_move - 2)), 'F': (parking_speed * speed_ratio)
+      }))
+      self.gcode_move.cmd_G90(self.gcode.create_gcode_command("G90", "G90", {})) # go absolute
+
+      return True
+
+    def _pickup_move_back_from_purge_in_place(self, context, gcmd = None):
+      if self.status == STATUS_PAUSED:
+        return False
+
+      if gcmd: gcmd.respond_info("Calling _pickup_move_back_from_purge_in_place...")
+      cfg               = self.get_macro_vars("_TOOLCHANGER_CONFIGURATION")
+      safe_y            = cfg['safe_y']
+      safe_y_no_tool    = cfg['safe_y_no_tool']
+      close_y           = cfg['close_y']
+      fast_speed        = cfg['fast_speed']
+      fast_speed_z      = cfg['fast_speed_z']
+      parking_speed     = cfg['parking_speed']
+      end_parking_speed = cfg['end_parking_speed']
+      speed_ratio       = cfg['speed_ratio']
+
+      pickup_tool = context['pickup_tool']
+      unlock_move = pickup_tool.params['params_park_unlock_move']
+
+      self.gcode_move.cmd_G91(self.gcode.create_gcode_command("G91", "G91", {})) # go relative
+      self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", {
+        'X': (1 * (unlock_move - 2)), 'F': (parking_speed * speed_ratio)
+      }))
+      self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", {
+        'Y': -15, 'F': (parking_speed * speed_ratio)
+      }))
+      self.gcode_move.cmd_G90(self.gcode.create_gcode_command("G90", "G90", {})) # go absolute
 
       return True
 
@@ -1589,7 +1717,6 @@ class Toolchanger:
       self.last_pickup_tool = None
       self.last_restore_position = None
 
-      # self.run_gcode('after_change_gcode', self.after_change_gcode, extra_context)
       return True
 
     def finalize_after_change(self, context, gcmd = None):
@@ -1631,16 +1758,14 @@ class Toolchanger:
          if (context is not None and 'pickup_tool' in context):
             self.last_pickup_tool = context['pickup_tool']
       if self.last_restore_position is None:
-        cur_x, cur_y, cur_z, cur_e = self.get_current_position()
         if (context is not None and 'restore_position' in context):
           self.last_restore_position = context['restore_position']
-        else:
-          self.last_restore_position = {'X': cur_x, 'Y': cur_y, 'Z': cur_z}
 
       # @TODO: it could be inner variable
       self.save_macro_var('PRINT_START', 'tc_no_tool_attached', 0)
 
       if self.is_in_priniting_state():
+        if gcmd: gcmd.respond_info("execute_toolchange_pause...Printer is in printing state.")
         self.run_gcode_from_command("SEND_MOBI_MESSAGE MSG='!!! Print was paused on toolhaead change and needs your attention.'")
         self.run_gcode_from_command("PAUSE MOVE=0 MODE=1")
 
@@ -1656,7 +1781,7 @@ class Toolchanger:
         if gcmd: gcmd.respond_info(
           "Error while tool changing from T%s to T%s. \n"
           "Please attach manually the tool `T%s` and \n"
-          "call `LTC_PAUSE_RESOLVE T=%s` macro after all done. \n"
+          "call `TTC_PAUSE_RESOLVE T=%s` macro after all done. \n"
           "To check the sensors state, please use: \n"
           "`QUERY_BUTTON button=carriagesense_t%s` \n"
           "`QUERY_BUTTON button=docksense_t%s` \n"
@@ -1676,6 +1801,7 @@ class Toolchanger:
       if self.status != STATUS_PAUSED:
         return False
 
+      if gcmd: gcmd.respond_info("Calling execute_toolchange_pause_resolve...")
       if not self.check_carriage_state(tool, 'PRESSED'):
         if gcmd: gcmd.respond_info("Tool T%s is not on the carriage." % (tool.tool_number))
         return False
@@ -1693,8 +1819,9 @@ class Toolchanger:
            (tool.tool_number, e))
         return False
 
-      # Apply offsets for new tool
+      # Apply offsets for new toolif gcmd: gcmd.respond_info("->>>>_set_tool_gcode_offset...")
       self._set_tool_gcode_offset(tool)
+
       # Preheat tool
       self._set_toolhead_temperature(tool, 0, True, gcmd)
       # change color in UI
@@ -1704,7 +1831,7 @@ class Toolchanger:
       self.save_macro_var('T%s' % tool.tool_number, 'color', "'c44'")
 
       # @TODO: remove it later. Legacy
-      self.save_macro_var('_LTC_PAUSE', 'is_ltc_paused', 1)
+      self.save_macro_var('_LTC_PAUSE', 'is_ltc_paused', 0)
       # set TMC current
       self._pickup_change_current(gcmd)
 
@@ -1717,7 +1844,7 @@ class Toolchanger:
       end_parking_speed = cfg['end_parking_speed']
       speed_ratio       = cfg['speed_ratio']
 
-      cur_x, cur_y, cur_z = self.get_current_position()
+      cur_x, cur_y, cur_z, cur_e = self.get_current_position()
       if cur_y < safe_y:
         self.gcode_move.cmd_G90(self.gcode.create_gcode_command("G90", "G90", {})) # go absolute
         self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G0", "G0", {
@@ -1725,6 +1852,7 @@ class Toolchanger:
         }))
 
       if self.is_in_paused_state():
+        if gcmd: gcmd.respond_info("execute_toolchange_pause_resolve...Printer is in pause state.")
         # @TODO: Clear and Prime tool after long pause???
         self._pickup_move_back_to_original_position({
           'dropoff_tool': self.last_dropoff_tool,
