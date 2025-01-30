@@ -66,6 +66,8 @@ class Toolchanger:
         self.last_dropoff_tool = None
         self.last_pickup_tool = None
         self.last_restore_position = None
+        self.last_max_velocity = None
+        self.last_max_accel = None
 
         self.printer.register_event_handler("homing:home_rails_begin", self._handle_home_rails_begin)
 
@@ -116,6 +118,9 @@ class Toolchanger:
         self.gcode.register_command("TTC_SAVE_TOOL_GCODE_OFFSETS",
                                     self.cmd_SAVE_TOOL_GCODE_OFFSETS,
                                     desc=self.cmd_SAVE_TOOL_GCODE_OFFSETS_help)
+        self.gcode.register_command("TTC_PRINT_STATS",
+                                    self.cmd_PRINT_STATS,
+                                    desc=self.cmd_PRINT_STATS_help)
         # @TODO: remove it later. Legacy
         self.gcode.register_command("TEST_MACROS_RUNNING",
                                     self.cmd_TEST_MACROS_RUNNING)
@@ -310,6 +315,31 @@ class Toolchanger:
         configfile.set(tool.name, 'gcode_x_offset', tool.gcode_x_offset)
         configfile.set(tool.name, 'gcode_y_offset', tool.gcode_y_offset)
         configfile.set(tool.name, 'gcode_z_offset', tool.gcode_z_offset)
+
+    cmd_PRINT_STATS_help = ""
+    def cmd_PRINT_STATS(self, gcmd):
+      stats = self.get_stats()
+      gcmd.respond_info("STAT: \n"
+                        "print_time: %s\n"
+                        "stalls: %s\n"
+                        "estimated_print_time: %s\n"
+                        "extruder: %s\n"
+                        "position: %s\n"
+                        "max_velocity: %s\n"
+                        "max_accel: %s\n"
+                        "minimum_cruise_ratio: %s\n"
+                        "square_corner_velocity: %s\n"
+                        % (
+                        stats['print_time'],
+                        stats['stalls'],
+                        stats['estimated_print_time'],
+                        stats['extruder'],
+                        stats['position'],
+                        stats['max_velocity'],
+                        stats['max_accel'],
+                        stats['minimum_cruise_ratio'],
+                        stats['square_corner_velocity']
+                        ))
 
     def cmd_TEST_MACROS_RUNNING(self, gcmd):
         # ----------------------------------------
@@ -678,6 +708,25 @@ class Toolchanger:
     #
     #
     #
+    def get_stats(self):
+      curtime = self.printer.get_reactor().monotonic()
+      toolhead = self.printer.lookup_object('toolhead')
+      return toolhead.get_status(curtime)
+      # { 'print_time': print_time,
+      #   'stalls': self.print_stall,
+      #   'estimated_print_time': estimated_print_time,
+      #   'extruder': self.extruder.get_name(),
+      #   'position': self.Coord(*self.commanded_pos),
+      #   'max_velocity': self.max_velocity,
+      #   'max_accel': self.max_accel,
+      #   'minimum_cruise_ratio': self.min_cruise_ratio,
+      #   'square_corner_velocity': self.square_corner_velocity}
+
+    def get_printer_max_velocity(self):
+       return self.get_stats()['max_velocity']
+
+    def get_printer_max_accel(self):
+       return self.get_stats()['max_accel']
 
     def get_printer_status(self):
       curtime = self.printer.get_reactor().monotonic()
@@ -844,6 +893,8 @@ class Toolchanger:
 
       self.gcode_move.cmd_G90(self.gcode.create_gcode_command("G90", "G90", {})) # go absolute
       if (not self._check_liftbar_is_homed(context, gcmd)): return False
+
+      self._drop_set_velocity_and_acc(context, gcmd)
       if (not self._drop_raise_toolhead(context, gcmd)): return False
       if (not self._drop_move_to_close_position(context, gcmd)): return False
       if (not self._drop_move_to_park_position(context, gcmd)): return False
@@ -866,6 +917,19 @@ class Toolchanger:
         if gcmd: gcmd.respond_info("Liftbar was not homed. Home lieftbar first.")
         self.execute_toolchange_pause(context, gcmd)
         return False
+
+      return True
+
+    def _drop_set_velocity_and_acc(self, context, gcmd = None):
+      if self.status == STATUS_PAUSED:
+        return False
+
+      self.last_max_velocity = self.get_printer_max_velocity()
+      self.last_max_accel = self.get_printer_max_accel()
+
+      change_max_velocity = self.get_macro_var('_TOOLCHANGER_CONFIGURATION', 'change_max_velocity', 750)
+      change_max_accel = self.get_macro_var('_TOOLCHANGER_CONFIGURATION', 'change_max_accel', 17000)
+      self.run_gcode_from_command("SET_VELOCITY_LIMIT VELOCITY=%s ACCEL=%s" % (change_max_velocity, change_max_accel))
 
       return True
 
@@ -971,9 +1035,9 @@ class Toolchanger:
 
       if gcmd: gcmd.respond_info("Calling _drop_change_current...")
       # @TODO: Load from configuration.
-      self.save_macro_var('_TOOLCHANGER_CONFIGURATION', 'run_current_x', 0.875)
-      self.save_macro_var('_TOOLCHANGER_CONFIGURATION', 'run_current_y', 0.875)
-      self.save_macro_var('_TOOLCHANGER_CONFIGURATION', 'run_current_z', 0.875)
+      # self.save_macro_var('_TOOLCHANGER_CONFIGURATION', 'run_current_x', 0.875)
+      # self.save_macro_var('_TOOLCHANGER_CONFIGURATION', 'run_current_y', 0.875)
+      # self.save_macro_var('_TOOLCHANGER_CONFIGURATION', 'run_current_z', 0.875)
 
       cfg = self.get_macro_vars('_TOOLCHANGER_CONFIGURATION')
       change_current_x = cfg['change_current_x']
@@ -999,7 +1063,7 @@ class Toolchanger:
       x_pos =  tool.params['params_park_x'] - tool.params['params_park_unlock_move']
 
       x_pos_correction = 0
-      corrections_steps = [0, 0.25, 0.5, 0.75, 1, 1.10, 1.20, 1.30, 1.40, 1.50, 1.6, 1.7, 1.8, 1.9, 2.0]
+      corrections_steps = [0, 0.25, 0.5, 0.75, 1, 1.10, 1.20, 1.30, 1.40, 1.50, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9]
 
       if tool.tool_number not in self.drop_docksense_corrections:
         self.drop_docksense_corrections[tool.tool_number] = []
@@ -1008,10 +1072,10 @@ class Toolchanger:
         self.drop_docksense_corrections_current[tool.tool_number] = 0
 
       x_pos_correction = self.drop_docksense_corrections_current[tool.tool_number]
-      if len(self.drop_docksense_corrections[tool.tool_number]) > 5:
+      if len(self.drop_docksense_corrections[tool.tool_number]) > 1:
         avg = sum(self.drop_docksense_corrections[tool.tool_number]) / len(self.drop_docksense_corrections[tool.tool_number])
-        if avg > corrections_steps[1]:
-           x_pos_correction = x_pos_correction + (corrections_steps[1] / 2)
+        if avg >= corrections_steps[1]:
+           x_pos_correction = x_pos_correction + (avg / 2)
            self.drop_docksense_corrections_current[tool.tool_number] = x_pos_correction # save it for next run
            self.drop_docksense_corrections[tool.tool_number] = [] # reset stats
 
@@ -1021,12 +1085,12 @@ class Toolchanger:
 
       self.gcode_move.cmd_G90(self.gcode.create_gcode_command("G90", "G90", {})) # go absolute
       for step in corrections_steps:
-        if gcmd: gcmd.respond_info("Toolhead T%s checking docksense with step=%s (correction=%s)." % (tool.tool_number, step, x_pos_correction))
+        if gcmd: gcmd.respond_info("Dropoff: Toolhead T%s checking docksense with step=%s (correction=%s)." % (tool.tool_number, step, x_pos_correction))
         g0_params = {'X': (x_pos - (step + x_pos_correction)), 'F': (end_parking_speed * speed_ratio)}
         self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G1", "G1", g0_params))
         self.run_gcode_from_command("M400")
         if self.check_dock_state(tool, 'PRESSED'):
-            if gcmd: gcmd.respond_info("Toolhead T%s docksense was triggered." % (tool.tool_number))
+            if gcmd: gcmd.respond_info("Dropoff: Toolhead T%s docksense was triggered." % (tool.tool_number))
 
             if len(self.drop_docksense_corrections[tool.tool_number]) > 100:
               avg_correction = sum(self.drop_docksense_corrections[tool.tool_number]) / len(self.drop_docksense_corrections[tool.tool_number])
@@ -1035,7 +1099,7 @@ class Toolchanger:
 
             self.drop_docksense_corrections[tool.tool_number].append(step)
             if gcmd:
-              gcmd.respond_info("Toolhead T%s average `drop_docksense_corrections` step correction=%s." %
+              gcmd.respond_info("Dropoff: Toolhead T%s average `drop_docksense_corrections` step=%s." %
                 (tool.tool_number, sum(self.drop_docksense_corrections[tool.tool_number]) / len(self.drop_docksense_corrections[tool.tool_number]))
               )
 
@@ -1344,21 +1408,35 @@ class Toolchanger:
 
       cur_x, cur_y, cur_z, cur_e = self.get_current_position()
 
+      x_pos_correction = 0
+      corrections_steps = [2.0, 2.25, 2.5, 2.75, 3.0, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4.0]
+
       if tool.tool_number not in self.pick_docksense_corrections:
         self.pick_docksense_corrections[tool.tool_number] = []
+
+      if tool.tool_number not in self.pick_docksense_corrections_current:
+        self.pick_docksense_corrections_current[tool.tool_number] = 0
+
+      x_pos_correction = self.pick_docksense_corrections_current
+      if len(self.pick_docksense_corrections[tool.tool_number]) > 1:
+        avg = sum(self.pick_docksense_corrections[tool.tool_number]) / len(self.pick_docksense_corrections[tool.tool_number])
+        if avg >= corrections_steps[1]:
+           x_pos_correction = x_pos_correction + (avg / 2)
+           self.pick_docksense_corrections_current[tool.tool_number] = x_pos_correction # save it for next run
+           self.pick_docksense_corrections[tool.tool_number] = [] # reset stats
 
       cfg = self.get_macro_vars("_TOOLCHANGER_CONFIGURATION")
       end_parking_speed = cfg['end_parking_speed']
       speed_ratio       = cfg['speed_ratio']
 
       self.gcode_move.cmd_G90(self.gcode.create_gcode_command("G90", "G90", {})) # go absolute
-      for step in [2.0, 2.25, 2.5, 2.75, 3.0]:
-        if gcmd: gcmd.respond_info("Toolhead T%s checking docksense with step=%s." % (tool.tool_number, step))
-        g0_params = {'X': (cur_x + step), 'F': (end_parking_speed * speed_ratio)}
+      for step in corrections_steps:
+        if gcmd: gcmd.respond_info("Pickup: Toolhead T%s checking docksense with step=%s (correction=%s)." % (tool.tool_number, step, x_pos_correction))
+        g0_params = {'X': (cur_x + (step + x_pos_correction)), 'F': (end_parking_speed * speed_ratio)}
         self.gcode_move.cmd_G1(self.gcode.create_gcode_command("G1", "G1", g0_params))
         self.run_gcode_from_command("M400")
         if self.check_dock_state(tool, 'RELEASED'):
-          if gcmd: gcmd.respond_info("Toolhead T%s docksense was released." % (tool.tool_number))
+          if gcmd: gcmd.respond_info("Pickup: Toolhead T%s docksense was released." % (tool.tool_number))
 
           if len(self.pick_docksense_corrections[tool.tool_number]) > 100:
             avg_correction = sum(self.pick_docksense_corrections[tool.tool_number]) / len(self.pick_docksense_corrections[tool.tool_number])
@@ -1366,7 +1444,7 @@ class Toolchanger:
             self.pick_docksense_corrections[tool.tool_number].append(avg_correction)
           self.pick_docksense_corrections[tool.tool_number].append(step)
           if gcmd:
-            gcmd.respond_info("Toolhead T%s average `pick_docksense_corrections` step correction=%s." %
+            gcmd.respond_info("Pickup: Toolhead T%s average `pick_docksense_corrections` step=%s." %
               (tool.tool_number, sum(self.pick_docksense_corrections[tool.tool_number]) / len(self.pick_docksense_corrections[tool.tool_number]))
             )
 
@@ -1678,12 +1756,23 @@ class Toolchanger:
 
       return True
 
+    def _pickup_restore_velocity_and_acc(self, context, gcmd = None):
+      if self.status == STATUS_PAUSED:
+        return False
+
+      if self.last_max_velocity is not None and self.last_max_accel is not None:
+        self.run_gcode_from_command("SET_VELOCITY_LIMIT VELOCITY=%s ACCEL=%s" % (self.last_max_velocity, self.last_max_accel))
+
+      self.last_max_velocity = None
+      self.last_max_accel = None
+      return True
+
     def after_change(self, context, gcmd = None):
       if self.status == STATUS_PAUSED:
         return False
 
       if gcmd: gcmd.respond_info("Calling after_change...")
-      extra_context = {}
+      # extra_context = {}
 
       if (context is not None):
         dropoff_tool = context['dropoff_tool'] if 'dropoff_tool' in context else None
@@ -1707,15 +1796,17 @@ class Toolchanger:
         if dropoff_tool is not None:
           self.run_gcode_from_command("LIFTBAR_LAYER_CHANGE")
 
-        extra_context = {
-          'dropoff_tool': dropoff_tool.name if dropoff_tool else None,
-          'pickup_tool': pickup_tool.name if pickup_tool else None,
-          'restore_position': context['restore_position'] if 'restore_position' in context else {}
-        }
+        # extra_context = {
+        #   'dropoff_tool': dropoff_tool.name if dropoff_tool else None,
+        #   'pickup_tool': pickup_tool.name if pickup_tool else None,
+        #   'restore_position': context['restore_position'] if 'restore_position' in context else {}
+        # }
 
       self.last_dropoff_tool = None
       self.last_pickup_tool = None
       self.last_restore_position = None
+
+      self._pickup_restore_velocity_and_acc(context, gcmd)
 
       return True
 
@@ -1819,19 +1910,15 @@ class Toolchanger:
            (tool.tool_number, e))
         return False
 
-      # Apply offsets for new toolif gcmd: gcmd.respond_info("->>>>_set_tool_gcode_offset...")
+      # Apply offsets for new toolif gcmd: gcmd.respond_info
       self._set_tool_gcode_offset(tool)
 
       # Preheat tool
       self._set_toolhead_temperature(tool, 0, True, gcmd)
-      # change color in UI
-      for tool_number in self.printer.lookup_object('toolchanger').tool_numbers:
-        self.save_macro_var('T%s' % tool_number, 'color', "''")
-      # change color in UI for active tool
-      self.save_macro_var('T%s' % tool.tool_number, 'color', "'c44'")
 
       # @TODO: remove it later. Legacy
       self.save_macro_var('_LTC_PAUSE', 'is_ltc_paused', 0)
+
       # set TMC current
       self._pickup_change_current(gcmd)
 
@@ -1851,34 +1938,29 @@ class Toolchanger:
           'Y': safe_y, 'F': (fast_speed * speed_ratio)
         }))
 
+      last_context = {
+        'dropoff_tool': self.last_dropoff_tool,
+        'pickup_tool': tool,
+        'restore_position': self.last_restore_position
+      }
+
       if self.is_in_paused_state():
         if gcmd: gcmd.respond_info("execute_toolchange_pause_resolve...Printer is in pause state.")
         # @TODO: Clear and Prime tool after long pause???
-        self._pickup_move_back_to_original_position({
-          'dropoff_tool': self.last_dropoff_tool,
-          'pickup_tool': tool,
-          'restore_position': self.last_restore_position
-        }, gcmd)
-        self.run_gcode_from_command("LIFTBAR_LAYER_CHANGE")
+
+        self._pickup_move_back_to_original_position(last_context, gcmd)
+        self.after_change(last_context, gcmd)
+        self.finalize_after_change(last_context, gcmd)
+
+        # self.run_gcode_from_command("LIFTBAR_LAYER_CHANGE")
         self.run_gcode_from_command("M400")
         self.run_gcode_from_command("RESTORE_GCODE_STATE NAME=_toolchange_state MOVE=0")
         self.run_gcode_from_command("SAVE_GCODE_STATE NAME=PAUSE_STATE")
         self.save_macro_var('RESUME', 'pause_mode', 1)
         self.run_gcode_from_command("RESUME")
-
-      self.last_dropoff_tool = None
-      self.last_pickup_tool = None
-      self.last_restore_position = None
-
-      # @TODO: remove it later. Legacy
-      self.save_macro_var('_LTC_PAUSE', 'restore_position_x', -1)
-      self.save_macro_var('_LTC_PAUSE', 'restore_position_y', -1)
-      self.save_macro_var('_LTC_PAUSE', 'restore_position_z', -1)
-      self.save_macro_var('_LTC_PAUSE', 'restore_position_saved', 0)
-
-      # @TODO: remove it later. Legacy
-      self.save_macro_var('_LTC_PAUSE', 'dropoff_tool_number', -1)
-      self.save_macro_var('_LTC_PAUSE', 'pickup_tool_number', -1)
+      else:
+        self.after_change(last_context, gcmd)
+        self.finalize_after_change(last_context, gcmd)
 
 def get_params_dict(config):
     result = {}
